@@ -36,7 +36,7 @@ func main() {
 	dummyHandler := NewDummyHandler(manager)
 	exportRepo := export.NewExportRepo(client, summaryAlias, detailAlias)
 	exportService := export.NewExportService(exportRepo)
-	exportHandler := export.NewExportHandler(exportService, writeServiceError)
+	exportHandler := export.NewExportHandler(exportService)
 	server := &http.Server{Addr: env("HTTP_ADDR", "127.0.0.1:8080"), Handler: NewRoutes(handler, summaryHandler, dummyHandler, exportHandler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: dummyTimeout + 30*time.Second, IdleTimeout: 60 * time.Second}
 	stop, cancelStop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancelStop()

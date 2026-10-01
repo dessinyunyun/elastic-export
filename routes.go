@@ -35,7 +35,19 @@ func NewRoutes(handler *EngineDetailHandler, summaryHandler *EngineSummaryHandle
 		c.Next()
 	})
 	router.GET("/health", handler.Health)
-	router.GET("/export", exportHandler.Stream)
+	router.GET("/export", func(c *gin.Context) {
+		if err := exportHandler.Stream(c); err != nil {
+			c.Abort()
+			// Headers cannot be replaced after an NDJSON stream has been written.
+			if c.Writer.Written() || c.Request.Context().Err() != nil {
+				return
+			}
+			c.Writer.Header().Del("Content-Type")
+			c.Writer.Header().Del("Content-Disposition")
+			c.Writer.Header().Del("X-Accel-Buffering")
+			writeServiceError(c, err)
+		}
+	})
 	router.GET("/engine-detail/:id", handler.GetByApplicationID)
 	router.GET("/engine-summary", summaryHandler.Search)
 	router.GET("/engine-summary/:id", summaryHandler.Get)

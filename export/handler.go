@@ -19,19 +19,17 @@ const RequestTimeout = 30 * time.Minute
 const writeTimeout = 30 * time.Second
 
 type ExportHandler struct {
-	service    *ExportService
-	writeError func(*gin.Context, error)
+	service *ExportService
 }
 
-func NewExportHandler(service *ExportService, writeError func(*gin.Context, error)) *ExportHandler {
-	return &ExportHandler{service: service, writeError: writeError}
+func NewExportHandler(service *ExportService) *ExportHandler {
+	return &ExportHandler{service: service}
 }
 
-func (h *ExportHandler) Stream(c *gin.Context) {
+func (h *ExportHandler) Stream(c *gin.Context) error {
 	filter, err := parseFilter(c)
 	if err != nil {
-		h.writeError(c, err)
-		return
+		return err
 	}
 	ctx := c.Request.Context()
 	var responseWriter http.ResponseWriter = c.Writer
@@ -100,25 +98,21 @@ func (h *ExportHandler) Stream(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("export stopped after %d rows (stream_started=%t): %v", count, started, err)
-		if !started && !c.Writer.Written() && ctx.Err() == nil {
-			h.writeError(c, err)
-		}
 		// Do not flush leftover bytes or append a JSON error to a partial NDJSON stream.
-		return
+		return err
 	}
 	if !started {
 		if err := prepareWrite(); err != nil {
-			if ctx.Err() == nil {
-				h.writeError(c, err)
-			}
-			return
+			return err
 		}
 		begin()
 		if err := flushHTTP(); err != nil {
 			log.Printf("empty export flush: %v", err)
+			return err
 		}
 	}
 	log.Printf("export completed: %d rows", count)
+	return nil
 }
 
 func parseFilter(c *gin.Context) (Filter, error) {
