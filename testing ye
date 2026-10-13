@@ -1,0 +1,734 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+)
+
+var isMonitoring = true
+
+var elasticURL = "http://localhost:9200"
+var elasticUsername = ""
+var elasticPassword = ""
+
+var outputFile = "elastic_monitor.jsonl"
+var pollingInterval = 2 * time.Second
+
+type nodeSample struct {
+	ID      string           `json:"id"`
+	Name    string           `json:"name"`
+	Metrics map[string]int64 `json:"metrics"`
+}
+
+type sample struct {
+	Timestamp time.Time    `json:"timestamp"`
+	Nodes     []nodeSample `json:"nodes"`
+}
+
+func main() {
+	log.SetFlags(log.Ltime)
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	var err error
+	if isMonitoring {
+		err = monitor(ctx)
+	} else {
+		err = analyze(ctx)
+	}
+
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func monitor(ctx context.Context) error {
+	if pollingInterval <= 0 {
+		return fmt.Errorf("pollingInterval must be positive")
+	}
+
+	u, err := url.Parse(
+		strings.TrimRight(elasticURL, "/") +
+			"/_nodes/stats/os,jvm,thread_pool,indices,fs,breaker",
+	)
+	if err != nil {
+		return err
+	}
+
+	q := u.Query()
+	q.Set("filter_path", strings.Join([]string{
+		"_nodes.failed",
+		"nodes.*.name",
+		"nodes.*.os.cpu.percent",
+		"nodes.*.os.mem.free_in_bytes",
+		"nodes.*.os.mem.available_in_bytes",
+		"nodes.*.jvm.uptime_in_millis",
+		"nodes.*.jvm.mem.heap_used_percent",
+		"nodes.*.jvm.gc.collectors.*.collection_count",
+		"nodes.*.jvm.gc.collectors.*.collection_time_in_millis",
+		"nodes.*.thread_pool.search.active",
+		"nodes.*.thread_pool.search.queue",
+		"nodes.*.thread_pool.search.rejected",
+		"nodes.*.indices.search.query_total",
+		"nodes.*.indices.search.query_time_in_millis",
+		"nodes.*.indices.search.fetch_total",
+		"nodes.*.indices.search.fetch_time_in_millis",
+		"nodes.*.indices.search.open_contexts",
+		"nodes.*.fs.io_stats.total.read_kilobytes",
+		"nodes.*.fs.io_stats.total.write_kilobytes",
+		"nodes.*.breakers.*.tripped",
+	}, ","))
+	u.RawQuery = q.Encode()
+
+	f, err := os.OpenFile(
+		outputFile,
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0600,
+	)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	encoder := json.NewEncoder(f)
+	client := &http.Client{Timeout: 10 * time.Second}
+	defer client.CloseIdleConnections()
+
+	log.Printf(
+		"Monitoring started; output=%s; interval=%s; CPU=host OS",
+		outputFile,
+		pollingInterval,
+	)
+
+	ticker := time.NewTicker(pollingInterval)
+	defer ticker.Stop()
+
+	// Request sinkron: tidak ada polling yang berjalan bersamaan.
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Monitoring stopped")
+			return nil
+
+		case <-ticker.C:
+			s, err := fetch(ctx, client, u.String())
+			if err != nil {
+				if ctx.Err() != nil {
+					log.Printf("Monitoring stopped")
+					return nil
+				}
+				log.Printf("Polling error: %v", err)
+				continue
+			}
+
+			if err := encoder.Encode(s); err != nil {
+				return fmt.Errorf("write JSONL: %w", err)
+			}
+
+			for _, n := range s.Nodes {
+				log.Printf(
+					"NODE=%s CPU=%s HEAP=%s QUEUE=%s REJECTED=%s OPEN_CONTEXTS=%s",
+					n.Name,
+					metric(n.Metrics, "cpu_percent", "%"),
+					metric(n.Metrics, "heap_percent", "%"),
+					metric(n.Metrics, "search_queue", ""),
+					metric(n.Metrics, "search_rejected", ""),
+					metric(n.Metrics, "open_contexts", ""),
+				)
+			}
+		}
+	}
+}
+
+func fetch(
+	ctx context.Context,
+	client *http.Client,
+	endpoint string,
+) (sample, error) {
+	s := sample{Timestamp: time.Now().UTC()}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		endpoint,
+		nil,
+	)
+	if err != nil {
+		return s, err
+	}
+
+	if elasticUsername != "" || elasticPassword != "" {
+		req.SetBasicAuth(elasticUsername, elasticPassword)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return s, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return s, fmt.Errorf(
+			"HTTP %s: %s",
+			resp.Status,
+			strings.TrimSpace(string(body)),
+		)
+	}
+
+	var raw struct {
+		Status struct {
+			Failed int `json:"failed"`
+		} `json:"_nodes"`
+		Nodes map[string]map[string]any `json:"nodes"`
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+
+	if err := decoder.Decode(&raw); err != nil {
+		return s, fmt.Errorf("decode Nodes Stats: %w", err)
+	}
+
+	if raw.Status.Failed > 0 {
+		log.Printf(
+			"Warning: stats unavailable for %d nodes",
+			raw.Status.Failed,
+		)
+	}
+
+	if len(raw.Nodes) == 0 {
+		return s, fmt.Errorf("Nodes Stats returned no nodes")
+	}
+
+	paths := map[string]string{
+		"cpu_percent":         "os.cpu.percent",
+		"heap_percent":        "jvm.mem.heap_used_percent",
+		"uptime_ms":           "jvm.uptime_in_millis",
+		"ram_free_bytes":      "os.mem.free_in_bytes",
+		"ram_available_bytes": "os.mem.available_in_bytes",
+		"search_active":       "thread_pool.search.active",
+		"search_queue":        "thread_pool.search.queue",
+		"search_rejected":     "thread_pool.search.rejected",
+		"query_ops":           "indices.search.query_total",
+		"query_time_ms":       "indices.search.query_time_in_millis",
+		"fetch_ops":           "indices.search.fetch_total",
+		"fetch_time_ms":       "indices.search.fetch_time_in_millis",
+		"open_contexts":       "indices.search.open_contexts",
+		"disk_read_bytes":     "fs.io_stats.total.read_kilobytes",
+		"disk_write_bytes":    "fs.io_stats.total.write_kilobytes",
+	}
+
+	for id, rawNode := range raw.Nodes {
+		n := nodeSample{
+			ID:      id,
+			Name:    id,
+			Metrics: make(map[string]int64),
+		}
+
+		if name, ok := rawNode["name"].(string); ok && name != "" {
+			n.Name = name
+		}
+
+		for key, path := range paths {
+			v, ok := numberAt(rawNode, path)
+			if !ok {
+				continue
+			}
+
+			if strings.HasPrefix(key, "disk_") {
+				if v > math.MaxInt64/1024 {
+					continue
+				}
+				v *= 1024
+			}
+
+			n.Metrics[key] = v
+		}
+
+		collectors, _ := valueAt(
+			rawNode,
+			"jvm.gc.collectors",
+		).(map[string]any)
+
+		// Simpan per collector agar reset dihitung masing-masing.
+		for name, obj := range collectors {
+			m, _ := obj.(map[string]any)
+
+			if v, ok := numberAt(m, "collection_count"); ok {
+				n.Metrics["gc_count."+name] = v
+			}
+
+			if v, ok := numberAt(m, "collection_time_in_millis"); ok {
+				n.Metrics["gc_time_ms."+name] = v
+			}
+		}
+
+		breakers, _ := valueAt(rawNode, "breakers").(map[string]any)
+
+		for name, obj := range breakers {
+			m, _ := obj.(map[string]any)
+
+			if v, ok := numberAt(m, "tripped"); ok {
+				n.Metrics["breaker_tripped."+name] = v
+			}
+		}
+
+		s.Nodes = append(s.Nodes, n)
+	}
+
+	sort.Slice(s.Nodes, func(i, j int) bool {
+		return s.Nodes[i].ID < s.Nodes[j].ID
+	})
+
+	return s, nil
+}
+
+func valueAt(m map[string]any, path string) any {
+	var v any = m
+
+	for _, key := range strings.Split(path, ".") {
+		obj, ok := v.(map[string]any)
+		if !ok {
+			return nil
+		}
+		v = obj[key]
+	}
+
+	return v
+}
+
+func numberAt(m map[string]any, path string) (int64, bool) {
+	n, ok := valueAt(m, path).(json.Number)
+	if !ok {
+		return 0, false
+	}
+
+	v, err := n.Int64()
+	return v, err == nil && v >= 0
+}
+
+func metric(m map[string]int64, key, suffix string) string {
+	if v, ok := m[key]; ok {
+		return fmt.Sprintf("%d%s", v, suffix)
+	}
+	return "N/A"
+}
+
+type gauge struct {
+	count int64
+	min   int64
+	max   int64
+	first int64
+	last  int64
+	sum   float64
+}
+
+func (g *gauge) add(v int64) {
+	if g.count == 0 {
+		g.min = v
+		g.max = v
+		g.first = v
+	}
+
+	if v < g.min {
+		g.min = v
+	}
+	if v > g.max {
+		g.max = v
+	}
+
+	g.last = v
+	g.sum += float64(v)
+	g.count++
+}
+
+type nodeSummary struct {
+	name    string
+	first   time.Time
+	last    time.Time
+	samples int
+	resets  int
+
+	gauges   map[string]*gauge
+	previous map[string]int64
+	totals   map[string]int64
+
+	// Hanya nilai CPU disimpan untuk menghitung P95 saat analisis.
+	cpu []float64
+
+	pairPrevious map[string][2]int64
+	pairTotals   map[string][2]int64
+}
+
+func delta(current, previous int64, restart bool) int64 {
+	if restart || current < previous {
+		// Setelah reset, hanya nilai counter baru yang dapat diamati.
+		return current
+	}
+	return current - previous
+}
+
+func isCounter(key string) bool {
+	switch key {
+	case "search_rejected",
+		"query_ops",
+		"query_time_ms",
+		"fetch_ops",
+		"fetch_time_ms",
+		"disk_read_bytes",
+		"disk_write_bytes":
+		return true
+	}
+
+	return strings.HasPrefix(key, "gc_") ||
+		strings.HasPrefix(key, "breaker_tripped.")
+}
+
+func (n *nodeSummary) add(s nodeSample, ts time.Time) {
+	if n.samples == 0 {
+		n.first = ts
+	}
+
+	n.last = ts
+	n.name = s.Name
+	n.samples++
+
+	uptime, hasUptime := s.Metrics["uptime_ms"]
+	oldUptime, hadUptime := n.previous["uptime_ms"]
+
+	restart := hasUptime && hadUptime && uptime < oldUptime
+	resetDetected := restart
+
+	for key, v := range s.Metrics {
+		if v < 0 {
+			continue
+		}
+
+		if isCounter(key) {
+			if old, ok := n.previous[key]; ok {
+				n.totals[key] += delta(v, old, restart)
+
+				if v < old {
+					resetDetected = true
+				}
+			}
+			continue
+		}
+
+		g := n.gauges[key]
+		if g == nil {
+			g = &gauge{}
+			n.gauges[key] = g
+		}
+		g.add(v)
+
+		if key == "cpu_percent" {
+			n.cpu = append(n.cpu, float64(v))
+		}
+	}
+
+	// Rasio time/operations harus memakai pasangan interval yang sama.
+	for _, prefix := range []string{"query", "fetch"} {
+		ops, okOps := s.Metrics[prefix+"_ops"]
+		ms, okMS := s.Metrics[prefix+"_time_ms"]
+
+		if !okOps || !okMS || ops < 0 || ms < 0 {
+			delete(n.pairPrevious, prefix)
+			continue
+		}
+
+		if old, ok := n.pairPrevious[prefix]; ok {
+			reset := restart || ops < old[0] || ms < old[1]
+
+			total := n.pairTotals[prefix]
+			total[0] += delta(ops, old[0], reset)
+			total[1] += delta(ms, old[1], reset)
+			n.pairTotals[prefix] = total
+		}
+
+		n.pairPrevious[prefix] = [2]int64{ops, ms}
+	}
+
+	if resetDetected {
+		n.resets++
+	}
+
+	// Pertahankan baseline jika field sementara hilang.
+	// Saat restart, hapus baseline lama untuk field yang tidak tersedia.
+	if restart {
+		n.previous = make(map[string]int64)
+	}
+
+	for key, v := range s.Metrics {
+		if v >= 0 {
+			n.previous[key] = v
+		}
+	}
+}
+
+func analyze(ctx context.Context) error {
+	f, err := os.Open(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	nodes := make(map[string]*nodeSummary)
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+
+	line := 0
+	var first, last time.Time
+
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		line++
+
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+
+		var s sample
+		if err := json.Unmarshal(scanner.Bytes(), &s); err != nil {
+			log.Printf("Skipping invalid JSONL line %d: %v", line, err)
+			continue
+		}
+
+		if s.Timestamp.IsZero() || len(s.Nodes) == 0 {
+			log.Printf("Skipping line %d: missing timestamp or nodes", line)
+			continue
+		}
+
+		for _, sn := range s.Nodes {
+			if sn.ID == "" {
+				continue
+			}
+
+			n := nodes[sn.ID]
+			if n == nil {
+				n = &nodeSummary{
+					gauges:       make(map[string]*gauge),
+					previous:     make(map[string]int64),
+					totals:       make(map[string]int64),
+					pairPrevious: make(map[string][2]int64),
+					pairTotals:   make(map[string][2]int64),
+				}
+				nodes[sn.ID] = n
+			}
+
+			if n.samples > 0 && !s.Timestamp.After(n.last) {
+				log.Printf(
+					"Skipping non-increasing timestamp at line %d for node %s",
+					line,
+					sn.ID,
+				)
+				continue
+			}
+
+			n.add(sn, s.Timestamp)
+
+			if first.IsZero() || s.Timestamp.Before(first) {
+				first = s.Timestamp
+			}
+			if last.IsZero() || s.Timestamp.After(last) {
+				last = s.Timestamp
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read JSONL: %w", err)
+	}
+
+	if len(nodes) == 0 {
+		return fmt.Errorf("no valid node samples in %s", outputFile)
+	}
+
+	log.Printf("========== ELASTICSEARCH MONITOR ==========")
+	log.Printf("Duration: %s", last.Sub(first).Round(time.Millisecond))
+
+	ids := make([]string, 0, len(nodes))
+	for id := range nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		nodes[id].report(id)
+	}
+
+	log.Printf(
+		"Counter resets use the current value; activity before a reset " +
+			"between polls cannot be recovered. Counter decreases can also " +
+			"reflect shard relocation. N/A means insufficient observations.",
+	)
+
+	return nil
+}
+
+func (n *nodeSummary) report(id string) {
+	log.Printf("")
+	log.Printf("Node: %s (%s)", n.name, id)
+	log.Printf(
+		"Samples: %d | Duration: %s | Reset intervals: %d",
+		n.samples,
+		n.last.Sub(n.first).Round(time.Millisecond),
+		n.resets,
+	)
+
+	log.Printf("CPU (host OS)")
+	if g := n.gauges["cpu_percent"]; g != nil {
+		sort.Float64s(n.cpu)
+
+		// P95 dengan interpolasi linear.
+		pos := 0.95 * float64(len(n.cpu)-1)
+		lo := int(math.Floor(pos))
+		hi := int(math.Ceil(pos))
+		p95 := n.cpu[lo] +
+			(n.cpu[hi]-n.cpu[lo])*(pos-float64(lo))
+
+		log.Printf("  Average      : %.1f%%", g.sum/float64(g.count))
+		log.Printf("  P95          : %.1f%%", p95)
+		log.Printf("  Peak         : %.1f%%", float64(g.max))
+	} else {
+		log.Printf("  Average / P95 / Peak: N/A")
+	}
+
+	log.Printf("HEAP")
+	if g := n.gauges["heap_percent"]; g != nil {
+		log.Printf("  Average      : %.1f%%", g.sum/float64(g.count))
+		log.Printf("  Peak         : %.1f%%", float64(g.max))
+		log.Printf("  Initial      : %.1f%%", float64(g.first))
+		log.Printf("  Final        : %.1f%%", float64(g.last))
+	} else {
+		log.Printf("  Average / Peak / Initial / Final: N/A")
+	}
+
+	log.Printf("RAM")
+	if g := n.gauges["ram_available_bytes"]; g != nil {
+		log.Printf("  Min Available: %s", byteSize(g.min))
+	} else if g := n.gauges["ram_free_bytes"]; g != nil {
+		// Nodes Stats biasanya menyediakan free, bukan MemAvailable.
+		log.Printf(
+			"  Min Available: %s (OS free memory; MemAvailable unavailable)",
+			byteSize(g.min),
+		)
+	} else {
+		log.Printf("  Min Available: N/A")
+	}
+
+	log.Printf("SEARCH")
+	n.printPeak("Max Active", "search_active")
+	n.printPeak("Max Queue", "search_queue")
+	n.printCounter("Rejected", "search_rejected", "", false)
+	n.printCounter("Query Ops", "query_ops", "", false)
+	n.printAverage("Avg Query", "query")
+	n.printCounter("Fetch Ops", "fetch_ops", "", false)
+	n.printAverage("Avg Fetch", "fetch")
+
+	if g := n.gauges["open_contexts"]; g != nil {
+		log.Printf("  Open Contexts: %d (peak)", g.max)
+	} else {
+		log.Printf("  Open Contexts: N/A")
+	}
+
+	log.Printf("GC")
+	n.printCounter("Count", "gc_count.", "", false)
+	n.printCounter("Time", "gc_time_ms.", " ms", false)
+
+	log.Printf("DISK I/O")
+	n.printCounter("Read", "disk_read_bytes", "", true)
+	n.printCounter("Written", "disk_write_bytes", "", true)
+
+	log.Printf("BREAKER")
+	n.printCounter("Tripped", "breaker_tripped.", "", false)
+}
+
+func (n *nodeSummary) printPeak(label, key string) {
+	if g := n.gauges[key]; g != nil {
+		log.Printf("  %-13s: %d", label, g.max)
+	} else {
+		log.Printf("  %-13s: N/A", label)
+	}
+}
+
+func (n *nodeSummary) printAverage(label, prefix string) {
+	total := n.pairTotals[prefix]
+
+	if total[0] == 0 {
+		log.Printf("  %-13s: N/A (no observed operations)", label)
+		return
+	}
+
+	log.Printf(
+		"  %-13s: %.2f ms per shard operation",
+		label,
+		float64(total[1])/float64(total[0]),
+	)
+}
+
+func (n *nodeSummary) printCounter(
+	label, key, suffix string,
+	asBytes bool,
+) {
+	var total int64
+	found := false
+
+	for k, v := range n.totals {
+		if k == key ||
+			(strings.HasSuffix(key, ".") && strings.HasPrefix(k, key)) {
+			total += v
+			found = true
+		}
+	}
+
+	if !found {
+		log.Printf("  %-13s: N/A", label)
+		return
+	}
+
+	if asBytes {
+		log.Printf("  %-13s: %s", label, byteSize(total))
+		return
+	}
+
+	log.Printf("  %-13s: +%d%s", label, total, suffix)
+}
+
+func byteSize(v int64) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+
+	f := float64(v)
+	i := 0
+
+	for f >= 1024 && i < len(units)-1 {
+		f /= 1024
+		i++
+	}
+
+	return fmt.Sprintf("%.2f %s", f, units[i])
+}
